@@ -1,381 +1,599 @@
-"""tiny-eval — Zero-dependency sandboxed expression evaluator for Python.
+"""
+tiny-eval — Evaluation framework for autonomous AI agents.
 
-Safely evaluate Python expressions and statements in an isolated namespace.
-Supports whitelisted builtins, sandboxed globals, and timeout enforcement.
+Define benchmark suites, grade agent runs, track regressions, export reports.
+Zero dependencies. Built for the autonomous-agent workflow.
 
-Usage:
-    from tiny_eval import eval_expr, eval_stmt, Sandbox, EvalError
-
-    # Simple expression
-    result = eval_expr("2 + 3 * 4")  # 14
-
-    # With custom globals
-    result = eval_expr("x ** 2", {"x": 7})  # 49
-
-    # Sandboxed (no dangerous builtins)
-    result = eval_expr("open('/etc/passwd')", sandbox=Sandbox(strict=True))
-    # raises EvalError: access denied
-
-    # Statement execution
-    eval_stmt("total = sum(values)", {"values": [1, 2, 3]})
-    # returns {"total": 6}
-
-    # With timeout (enforced via signal.SIGALRM on Unix)
-    result = eval_expr("sum(range(10**7))", timeout=1.0)
-    # raises EvalError: evaluation timed out after 1.0s
+MIT License. https://github.com/hussain-alsaibai/tiny-eval
 """
 
 from __future__ import annotations
 
-import math
+import json
 import os
-import re
-import signal
-import sys
 import time
-from typing import Any, Callable
+import uuid
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Union
 
 
-__version__ = "0.1.0"
-__all__ = [
-    "eval_expr",
-    "eval_stmt",
-    "EvalError",
-    "Sandbox",
-    "TimeoutError",
-    "interpolate",
-    "evaluate_config_expr",
-]
+__version__ = "1.0.0"
 
 
-# ---------- Exceptions ----------
+# ──────────────────────────────────────────────
+# Grading Types
+# ──────────────────────────────────────────────
+
+class Grade(str, Enum):
+    PASS = "pass"
+    FAIL = "fail"
+    SKIP = "skip"
+    ERROR = "error"
 
 
-class EvalError(Exception):
-    """Raised when evaluation fails: syntax error, access denied, timeout."""
-    pass
+@dataclass
+class CriterionResult:
+    """Result of evaluating a single criterion."""
+    name: str
+    grade: Grade
+    score: float          # 0.0 – 1.0
+    message: str
+    details: Optional[dict] = None
+    duration_ms: float = 0.0
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["grade"] = self.grade.value
+        return d
 
 
-class TimeoutError(EvalError):
-    """Raised when evaluation exceeds the timeout."""
-    pass
+@dataclass
+class EvalResult:
+    """Result of evaluating a full suite of criteria against one agent run."""
+    eval_id: str
+    suite_name: str
+    agent_name: str
+    run_id: str
+    timestamp: float
+    criteria: list[CriterionResult]
+    overall_pass: bool
+    overall_score: float   # 0.0 – 1.0
+    grade: Grade
+    total_duration_ms: float
+    metadata: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "eval_id": self.eval_id,
+            "suite_name": self.suite_name,
+            "agent_name": self.agent_name,
+            "run_id": self.run_id,
+            "timestamp": self.timestamp,
+            "timestamp_iso": datetime.fromtimestamp(self.timestamp).isoformat(),
+            "criteria": [c.to_dict() for c in self.criteria],
+            "overall_pass": self.overall_pass,
+            "overall_score": self.overall_score,
+            "grade": self.grade.value,
+            "total_duration_ms": self.total_duration_ms,
+            "metadata": self.metadata,
+        }
+
+    def summary(self) -> str:
+        """Human-readable one-line summary."""
+        status = "✅ PASS" if self.overall_pass else "❌ FAIL"
+        return (f"{status} | {self.suite_name} | {self.agent_name} | "
+                f"score={self.overall_score:.1%} | {len(self.criteria)} criteria | "
+                f"{self.total_duration_ms:.0f}ms")
 
 
-# ---------- Sandbox ----------
+@dataclass
+class Criterion:
+    """
+    A single evaluation criterion.
+
+    Args:
+        name: Short identifier (e.g., "compiles", "tests_pass", "no_regression")
+        description: Human-readable explanation of what this checks
+        check: Callable[Dict -> bool | tuple[bool, str]]. Receives run context dict,
+               returns True (pass) or False (fail), or (bool, message) for detail.
+        weight: Contribution weight (0–1). Defaults to 1.0.
+        required: If True, any fail on this criterion makes overall FAIL. Default False.
+    """
+    name: str
+    description: str
+    check: Callable[[dict], Union[bool, tuple[bool, str]]]
+    weight: float = 1.0
+    required: bool = False
 
 
-class Sandbox:
-    """Controls what code can do inside the evaluator.
+# ──────────────────────────────────────────────
+# Benchmark Suite
+# ──────────────────────────────────────────────
+
+class EvalSuite:
+    """
+    A named collection of evaluation criteria forming a benchmark.
 
     Usage:
-        Sandbox()                       # relaxed (math, str, list, dict only)
-        Sandbox(strict=True)           # very strict (only math + basic types)
-        Sandbox(allowed_modules=["json", "re"])
-        Sandbox(max_iterations=1000)   # iteration guard
-        Sandbox(max_memory_mb=50)       # memory guard (approximate)
+        suite = EvalSuite("bug-fix-benchmark", [
+            Criterion("compiles", "Code must compile without errors",
+                      lambda ctx: ctx.get("compile_error") is None),
+            Criterion("tests_pass", "All tests pass",
+                      lambda ctx: ctx.get("test_failures", 0) == 0, weight=2.0),
+            Criterion("no_secrets", "No leaked secrets",
+                      lambda ctx: ctx.get("secrets_found", 0) == 0),
+        ])
+        result = suite.evaluate(
+            agent_name="cursor-agent",
+            run_id="run-abc123",
+            context={"compile_error": None, "test_failures": 0, "secrets_found": 0},
+        )
+        print(result.summary())
     """
-
-    DANGEROUS_BUILTINS = {
-        "open", "file", "__import__", "eval", "exec", "compile",
-        "reload", "breakpoint", "exit", "quit", "help",
-        "vars", "globals", "locals", "dir", "type",
-        "getattr", "setattr", "delattr", "hasattr",
-        "memoryview", "buffer", "classmethod", "staticmethod",
-        "property", "super", "object",
-        "__builtins__", "__class__", "__subclasses__",
-        "run", "R", "S",
-    }
-
-    DANGEROUS_PATTERNS = [
-        re.compile(r"\bos\.system\b"),
-        re.compile(r"\bos\.popen\b"),
-        re.compile(r"\bos\.spawn\b"),
-        re.compile(r"\bsubprocess\b"),
-        re.compile(r"\bimport\s+os\b"),
-        re.compile(r"\bimport\s+subprocess\b"),
-        re.compile(r"\bimport\s+sys\b"),
-        re.compile(r"\bimport\s+requests\b"),
-        re.compile(r"\bimport\s+urllib\b"),
-        re.compile(r"\bimport\s+http\b"),
-        re.compile(r"\b__import__\b"),
-        re.compile(r"\{\{.*\}\}"),  # template injection
-        re.compile(r"<script"),
-        re.compile(r"</script"),
-        re.compile(r"globals\(\)"),
-        re.compile(r"locals\(\)"),
-        re.compile(r"vars\(\)"),
-        re.compile(r"dir\(\)"),
-    ]
-
-    SAFE_BUILTINS = {
-        "abs": abs, "all": all, "any": any, "ascii": ascii,
-        "bin": bin, "bool": bool, "bytearray": bytearray,
-        "bytes": bytes, "callable": callable, "chr": chr,
-        "dict": dict, "divmod": divmod, "enumerate": enumerate,
-        "filter": filter, "float": float, "format": format,
-        "frozenset": frozenset, "hash": hash, "hex": hex,
-        "int": int, "isinstance": isinstance, "issubclass": issubclass,
-        "iter": iter, "len": len, "list": list, "map": map,
-        "max": max, "min": min, "next": next, "oct": oct,
-        "ord": ord, "pow": pow, "range": range, "repr": repr,
-        "reversed": reversed, "round": round, "set": set,
-        "slice": slice, "sorted": sorted, "str": str,
-        "sum": sum, "tuple": tuple, "zip": zip,
-        # Safe modules
-        "math": math,
-        "re": __import__("re"),
-        "json": __import__("json"),
-        "datetime": __import__("datetime"),
-        "decimal": __import__("decimal"),
-        "random": __import__("random"),
-        "functools": __import__("functools"),
-        "operator": __import__("operator"),
-        "string": __import__("string"),
-        "textwrap": __import__("textwrap"),
-        "time": __import__("time"),
-        "itertools": __import__("itertools"),
-        "collections": __import__("collections"),
-        "statistics": __import__("statistics"),
-        "uuid": __import__("uuid"),
-        "hashlib": __import__("hashlib"),
-    }
 
     def __init__(
         self,
-        *,
-        strict: bool = False,
-        allowed_builtins: dict | None = None,
-        allowed_modules: list | None = None,
-        max_iterations: int | None = None,
-        max_memory_mb: int | None = None,
-        allow_syscalls: bool = False,
-    ) -> None:
-        self._strict = strict
-        self._allowed: dict = {} if strict else dict(self.SAFE_BUILTINS)
-        if allowed_builtins:
-            self._allowed.update(allowed_builtins)
-        self._allowed_modules = set(allowed_modules or [])
-        self._max_iterations = max_iterations
-        self._max_memory_mb = max_memory_mb
-        self._allow_syscalls = allow_syscalls
+        name: str,
+        criteria: list[Criterion],
+        pass_threshold: float = 0.7,
+    ):
+        self.name = name
+        self.criteria = criteria
+        self.pass_threshold = pass_threshold  # overall score to consider PASS
 
-    def check(self, source: str) -> None:
-        """Validate source before evaluation. Raises EvalError on violation."""
-        if self._strict:
-            # Very strict: only allow simple expressions
-            if not re.match(r"^[\w\s.,()\[\]{}\"'\+\-*/<>=!|%^~?:]+$", source.strip()):
-                raise EvalError(
-                    f"Character not allowed in strict mode: {source[:50]}"
-                )
+    def evaluate(
+        self,
+        agent_name: str,
+        run_id: str,
+        context: dict,
+        metadata: Optional[dict] = None,
+    ) -> EvalResult:
+        """
+        Run all criteria against the given context and return an EvalResult.
+        """
+        start = time.perf_counter()
+        results: list[CriterionResult] = []
+        weighted_sum = 0.0
+        total_weight = 0.0
+        any_required_fail = False
 
-        # Check for dangerous patterns
-        for pattern in self.DANGEROUS_PATTERNS:
-            if pattern.search(source):
-                raise EvalError(
-                    f"Access denied: dangerous pattern detected in {source[:50]}"
-                )
+        for criterion in self.criteria:
+            c_start = time.perf_counter()
+            try:
+                raw = criterion.check(context)
+                if isinstance(raw, tuple):
+                    passed, message = raw
+                else:
+                    passed = bool(raw)
+                    message = "passed" if passed else "failed"
 
-        # Check for dangerous builtins in the source
-        for b in self.DANGEROUS_BUILTINS:
-            if re.search(rf"\b{re.escape(b)}\b", source):
-                # If the user didn't override this one, it's denied
-                if self._allowed.get(b) is None:
-                    raise EvalError(f"Builtin '{b}' is not allowed")
+            except Exception as exc:
+                passed = False
+                message = f"criterion raised: {type(exc).__name__}: {exc}"
 
-    def globals(self, **extra: Any) -> dict[str, Any]:
-        g: dict[str, Any] = {"__builtins__": self._allowed}
-        g.update(extra)
-        return g
+            c_duration = (time.perf_counter() - c_start) * 1000
+            score = 1.0 if passed else 0.0
+            grade = Grade.PASS if passed else Grade.FAIL
 
+            if criterion.required and not passed:
+                any_required_fail = True
 
-# ---------- Timeout helper ----------
+            results.append(CriterionResult(
+                name=criterion.name,
+                grade=grade,
+                score=score,
+                message=message,
+                details={"description": criterion.description},
+                duration_ms=c_duration,
+            ))
 
+            weighted_sum += score * criterion.weight
+            total_weight += criterion.weight
 
-class _TimeoutGuard:
-    """Context manager that enforces a wall-clock timeout via SIGALRM.
+        duration_ms = (time.perf_counter() - start) * 1000
+        overall_score = weighted_sum / total_weight if total_weight > 0 else 0.0
+        overall_pass = overall_score >= self.pass_threshold and not any_required_fail
 
-    Unix only (uses signal.SIGALRM). On Windows it's a no-op and the caller
-    is responsible for its own timeout.
-    """
+        if any_required_fail:
+            overall_score = 0.0
+            overall_pass = False
+            grade = Grade.FAIL
+        elif overall_pass:
+            grade = Grade.PASS
+        else:
+            grade = Grade.FAIL
 
-    def __init__(self, timeout: float) -> None:
-        self.timeout = timeout
-        self._old_handler: Any = None
-        self._supported = sys.platform != "win32"
-
-    def __enter__(self) -> "_TimeoutGuard":
-        if not self._supported:
-            return self
-        def _handler(signum: int, frame: Any) -> None:
-            raise TimeoutError(
-                f"evaluation timed out after {self.timeout}s"
-            )
-
-        self._old_handler = signal.signal(signal.SIGALRM, _handler)
-        # Use ceil so 0.1s still gives the handler time to fire
-        signal.alarm(max(1, int(round(self.timeout)) + 1))
-        return self
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        if not self._supported:
-            return
-        signal.alarm(0)
-        if self._old_handler is not None:
-            signal.signal(signal.SIGALRM, self._old_handler)
-
-
-# ---------- Core evaluators ----------
-
-
-def eval_expr(
-    source: str,
-    globals: dict | None = None,
-    *,
-    sandbox: Sandbox | None = None,
-    timeout: float | None = None,
-) -> Any:
-    """Evaluate a Python expression and return the result.
-
-    Args:
-        source: Python expression (e.g. "x + 1")
-        globals: Optional namespace dict
-        sandbox: Optional Sandbox for security
-        timeout: Max seconds (Unix only)
-
-    Returns:
-        The evaluated result
-
-    Raises:
-        EvalError: on syntax, security, or timeout violation
-    """
-    source = source.strip()
-
-    # If no explicit sandbox is provided, use a relaxed default so callers
-    # can still use `math`, `json`, etc. without explicit wiring.
-    sb = sandbox or Sandbox()
-
-    sb.check(source)
-
-    ns: dict[str, Any] = dict(sb.globals())
-    if globals:
-        ns.update(globals)
-
-    # Validate syntax before eval
-    try:
-        compile(source, "<tiny_eval>", "eval")
-    except SyntaxError as e:
-        raise EvalError(f"Syntax error: {e}")
-
-    with _TimeoutGuard(timeout) if timeout else _NoopGuard():
-        try:
-            return eval(source, ns)  # noqa: S307
-        except TimeoutError:
-            raise
-        except EvalError:
-            raise
-        except Exception as e:
-            raise EvalError(f"{type(e).__name__}: {e}")
-
-
-class _NoopGuard:
-    """Drop-in replacement for _TimeoutGuard when no timeout requested."""
-
-    def __enter__(self) -> "_NoopGuard":
-        return self
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
-        return False
-
-
-def eval_stmt(
-    source: str,
-    globals: dict | None = None,
-    *,
-    sandbox: Sandbox | None = None,
-    timeout: float | None = None,
-) -> dict[str, Any]:
-    """Execute Python statements and return the final namespace.
-
-    Args:
-        source: Python statements (e.g. "x = 2; y = x * 3")
-        globals: Optional starting namespace
-        sandbox: Optional Sandbox for security
-        timeout: Max seconds
-
-    Returns:
-        The final namespace dict (with any defined variables)
-
-    Raises:
-        EvalError: on syntax, security, or timeout violation
-    """
-    source = source.strip()
-
-    if sandbox:
-        sandbox.check(source)
-
-    ns: dict[str, Any] = dict(sandbox.globals() if sandbox else {})
-    if globals:
-        ns.update(globals)
-
-    try:
-        compiled = compile(source, "<tiny_eval>", "exec")
-    except SyntaxError as e:
-        raise EvalError(f"Syntax error: {e}")
-
-    with _TimeoutGuard(timeout) if timeout else _NoopGuard():
-        try:
-            exec(compiled, ns)  # noqa: S102
-        except TimeoutError:
-            raise
-        except EvalError:
-            raise
-        except Exception as e:
-            raise EvalError(f"{type(e).__name__}: {e}")
-
-    return ns
-
-
-# ---------- Config expression helper ----------
-
-
-def evaluate_config_expr(
-    expr: str,
-    variables: dict[str, Any],
-    *,
-    strict: bool = True,
-) -> Any:
-    """Evaluate a configuration expression with variable substitution.
-
-    Supports:
-        config.get("db.host")         -> str comparison
-        env["DATABASE_URL"]           -> env var access
-        int(os.environ["PORT"])       -> type casts
-        value if x > 0 else default   -> ternary
-
-    Usage in config loading:
-        evaluate_config_expr(
-            "int(os.environ['PORT']) if 'PORT' in os.environ else 8080",
-            {"os": __import__("os")}
+        return EvalResult(
+            eval_id=str(uuid.uuid4())[:8],
+            suite_name=self.name,
+            agent_name=agent_name,
+            run_id=run_id,
+            timestamp=time.time(),
+            criteria=results,
+            overall_pass=overall_pass,
+            overall_score=overall_score,
+            grade=grade,
+            total_duration_ms=duration_ms,
+            metadata=metadata or {},
         )
+
+
+# ──────────────────────────────────────────────
+# Evaluator — manages suites and reporting
+# ──────────────────────────────────────────────
+
+class Evaluator:
     """
-    return eval_expr(expr, variables, sandbox=Sandbox(strict=strict))
-
-
-# ---------- Template helper ----------
-
-
-def interpolate(text: str, **variables: Any) -> str:
-    """Simple {{variable}} interpolation, like Jinja2 without the dependency.
+    Manages multiple eval suites, runs batches, tracks history.
 
     Usage:
-        interpolate("Hello, {{name}}!", name="Alice")  # "Hello, Alice!"
-        interpolate("Port is {{ port }}", port=8080)   # "Port is 8080"
-    """
-    def replacer(m: "re.Match[str]") -> str:
-        key = m.group(1).strip()
-        if key in variables:
-            val = variables[key]
-            return str(val) if val is not None else ""
-        return m.group(0)
+        ev = Evaluator(storage_path=".tiny-eval")
+        ev.register_suite(bug_fix_suite)
+        ev.register_suite(security_suite)
 
-    return re.sub(r"\{\{([^}]+)\}\}", replacer, text)
+        result = ev.run("bug-fix-suit", agent_name="devin", run_id="r1", context={...})
+        batch = ev.run_batch("devin", run_contexts=[ctx1, ctx2, ctx3])
+
+        report = ev.generate_report(format="markdown")
+        print(report)
+    """
+
+    def __init__(self, storage_path: str | None = None):
+        self.storage_path = storage_path or os.path.join(
+            os.getcwd(), ".tiny-eval"
+        )
+        Path(self.storage_path).mkdir(parents=True, exist_ok=True)
+        self.suites: dict[str, EvalSuite] = {}
+
+    def register_suite(self, suite: EvalSuite):
+        self.suites[suite.name] = suite
+
+    def run(
+        self,
+        suite_name: str,
+        agent_name: str,
+        run_id: str,
+        context: dict,
+        metadata: Optional[dict] = None,
+    ) -> EvalResult:
+        if suite_name not in self.suites:
+            raise KeyError(f"No suite registered with name: {suite_name}. "
+                            f"Registered: {list(self.suites.keys())}")
+        result = self.suites[suite_name].evaluate(agent_name, run_id, context, metadata)
+        self._save_result(result)
+        return result
+
+    def run_batch(
+        self,
+        suite_name: str,
+        agent_name: str,
+        run_contexts: list[dict],
+        metadata: Optional[dict] = None,
+    ) -> list[EvalResult]:
+        """Run a suite against multiple contexts, e.g. multiple agent runs."""
+        results = []
+        for i, ctx in enumerate(run_contexts):
+            run_id = f"batch-{i+1}"
+            result = self.run(suite_name, agent_name, run_id, ctx, metadata)
+            results.append(result)
+        return results
+
+    def _save_result(self, result: EvalResult):
+        path = os.path.join(self.storage_path, f"{result.eval_id}.json")
+        with open(path, "w") as f:
+            json.dump(result.to_dict(), f, indent=2, default=str)
+
+    def _append_index(self, result: EvalResult):
+        idx_path = os.path.join(self.storage_path, ".index.jsonl")
+        with open(idx_path, "a") as f:
+            f.write(json.dumps({
+                "eval_id": result.eval_id,
+                "suite_name": result.suite_name,
+                "agent_name": result.agent_name,
+                "run_id": result.run_id,
+                "overall_pass": result.overall_pass,
+                "overall_score": result.overall_score,
+                "timestamp": result.timestamp,
+                "file": f"{result.eval_id}.json",
+            }) + "\n")
+
+    def list_results(self, suite_name: str | None = None,
+                     agent_name: str | None = None,
+                     limit: int = 50) -> list[dict]:
+        idx_path = os.path.join(self.storage_path, ".index.jsonl")
+        if not os.path.exists(idx_path):
+            return []
+        results = []
+        with open(idx_path) as f:
+            for line in f:
+                r = json.loads(line)
+                if suite_name and r["suite_name"] != suite_name:
+                    continue
+                if agent_name and r["agent_name"] != agent_name:
+                    continue
+                results.append(r)
+        results.sort(key=lambda x: x["timestamp"], reverse=True)
+        return results[:limit]
+
+    def regression_check(
+        self,
+        suite_name: str,
+        agent_name: str,
+        current_score: float,
+        window: int = 5,
+        threshold: float = 0.05,
+    ) -> dict:
+        """
+        Check if the current score is a regression vs recent history.
+
+        Returns a dict with:
+            is_regression: bool
+            previous_avg: float
+            delta: float
+            trend: "improving" | "stable" | "regressing"
+        """
+        recent = self.list_results(suite_name, agent_name, limit=window)
+        if not recent:
+            return {
+                "is_regression": False,
+                "previous_avg": None,
+                "delta": 0.0,
+                "trend": "unknown",
+            }
+
+        prev_scores = [r["overall_score"] for r in recent]
+        prev_avg = sum(prev_scores) / len(prev_scores)
+        delta = current_score - prev_avg
+
+        if delta < -threshold:
+            trend = "regressing"
+            is_regression = True
+        elif delta > threshold:
+            trend = "improving"
+            is_regression = False
+        else:
+            trend = "stable"
+            is_regression = False
+
+        return {
+            "is_regression": is_regression,
+            "previous_avg": prev_avg,
+            "delta": delta,
+            "trend": trend,
+            "window_size": len(prev_scores),
+        }
+
+    def generate_report(
+        self,
+        suite_name: str | None = None,
+        agent_name: str | None = None,
+        format: str = "markdown",
+        since: float | None = None,
+    ) -> str:
+        """
+        Generate a human-readable report.
+
+        format: "markdown" | "json" | "summary"
+        """
+        results = self.list_results(suite_name, suite_name, limit=200)
+        if since:
+            results = [r for r in results if r["timestamp"] >= since]
+
+        if format == "json":
+            return json.dumps(results, indent=2, default=str)
+
+        if format == "summary":
+            total = len(results)
+            passed = sum(1 for r in results if r["overall_pass"])
+            avg_score = (sum(r["overall_score"] for r in results) / total) if total else 0
+            return (
+                f"tiny-eval summary | {total} runs | "
+                f"{passed}/{total} passed ({passed/total:.0%}) | "
+                f"avg score: {avg_score:.1%}"
+            )
+
+        # Markdown
+        lines = [
+            "# tiny-eval Report",
+            "",
+            f"**Generated:** {datetime.now().isoformat()}",
+            f"**Suite filter:** {suite_name or 'all'}",
+            f"**Agent filter:** {agent_name or 'all'}",
+            f"**Total runs:** {len(results)}",
+        ]
+
+        if results:
+            passed = sum(1 for r in results if r["overall_pass"])
+            avg = sum(r["overall_score"] for r in results) / len(results)
+            lines += [
+                f"**Pass rate:** {passed}/{len(results)} ({passed/len(results):.1%})",
+                f"**Avg score:** {avg:.1%}",
+                "",
+                "## Recent Runs",
+                "",
+                "| Run ID | Agent | Suite | Score | Status | Timestamp |",
+                "| --- | --- | --- | --- | --- | --- |",
+            ]
+            for r in results[:20]:
+                status = "✅" if r["overall_pass"] else "❌"
+                ts = datetime.fromtimestamp(r["timestamp"]).strftime("%Y-%m-%d %H:%M")
+                lines.append(
+                    f"| {r['run_id']} | {r['agent_name']} | "
+                    f"{r['suite_name']} | {r['overall_score']:.0%} | "
+                    f"{status} | {ts} |"
+                )
+
+            lines += ["", "## Trend Analysis", ""]
+            by_agent: dict[str, list] = {}
+            for r in results:
+                by_agent.setdefault(r["agent_name"], []).append(r)
+
+            for agent, runs in sorted(by_agent.items()):
+                if len(runs) < 2:
+                    continue
+                scores = [r["overall_score"] for r in runs]
+                avg_s = sum(scores) / len(scores)
+                trend_char = "📈" if scores[0] > scores[-1] else "📉"
+                lines.append(
+                    f"- **{agent}**: {len(runs)} runs | avg {avg_s:.1%} "
+                    f"| latest {scores[0]:.1%} {trend_char}"
+                )
+
+        return "\n".join(lines)
+
+
+# ──────────────────────────────────────────────
+# Pre-built Standard Suites
+# ──────────────────────────────────────────────
+
+def bug_fix_suite() -> EvalSuite:
+    """
+    Standard benchmark for bug-fix agents.
+    Checks: compilation, tests, no new errors, no secrets, code quality.
+    """
+    return EvalSuite("bug-fix", [
+        Criterion(
+            "compiles",
+            "Code must compile without syntax or import errors",
+            lambda ctx: (ctx.get("compile_error") is None, "clean build")
+                       if ctx.get("compile_error") is None
+                       else (False, f"compile error: {ctx['compile_error']}"),
+            required=True,
+        ),
+        Criterion(
+            "tests_pass",
+            "All unit tests must pass",
+            lambda ctx: (
+                ctx.get("test_failures", -1) == 0,
+                f"{ctx.get('test_failures', '?')} failures"
+                if ctx.get("test_failures", -1) > 0
+                else "all pass",
+            ),
+            weight=2.0,
+            required=True,
+        ),
+        Criterion(
+            "no_regression",
+            "Existing tests must not regress",
+            lambda ctx: ctx.get("regression_count", 0) == 0,
+        ),
+        Criterion(
+            "no_secrets",
+            "No secrets or credentials in output",
+            lambda ctx: (
+                ctx.get("secrets_found", 0) == 0,
+                f"{ctx.get('secrets_found', 0)} secrets found"
+                if ctx.get("secrets_found", 0) > 0
+                else "clean",
+            ),
+        ),
+        Criterion(
+            "no_crash",
+            "Agent run must not crash",
+            lambda ctx: ctx.get("crashed", False) is False,
+            required=True,
+        ),
+        Criterion(
+            "reasonable_time",
+            "Run should complete in reasonable time (<10min for simple fix)",
+            lambda ctx: ctx.get("duration_s", 999) < 600,
+        ),
+    ], pass_threshold=0.75)
+
+
+def code_quality_suite() -> EvalSuite:
+    """
+    Code quality checks: linting, type errors, complexity.
+    """
+    return EvalSuite("code-quality", [
+        Criterion(
+            "no_lint_errors",
+            "Code must pass linting checks",
+            lambda ctx: ctx.get("lint_errors", 999) == 0,
+        ),
+        Criterion(
+            "no_type_errors",
+            "Type annotations must be valid (if used)",
+            lambda ctx: ctx.get("type_errors", 0) == 0,
+        ),
+        Criterion(
+            "test_coverage",
+            "New code should have test coverage",
+            lambda ctx: ctx.get("coverage_percent", 0) >= 60,
+        ),
+        Criterion(
+            "no_obvious_bugs",
+            "Static analysis should find no obvious bugs",
+            lambda ctx: ctx.get("static_bugs", 0) == 0,
+        ),
+    ], pass_threshold=0.75)
+
+
+def security_suite() -> EvalSuite:
+    """
+    Security checks: no secrets, no injection vectors, safe eval.
+    """
+    return EvalSuite("security", [
+        Criterion(
+            "no_leaked_secrets",
+            "No API keys, tokens, passwords in output",
+            lambda ctx: (
+                ctx.get("secrets_found", 0) == 0,
+                f"{ctx.get('secrets_found', 0)} secrets exposed"
+                if ctx.get("secrets_found", 0) > 0
+                else "clean",
+            ),
+            required=True,
+        ),
+        Criterion(
+            "no_code_injection",
+            "No eval/exec with unsanitized input",
+            lambda ctx: ctx.get("injection_risk", False) is False,
+        ),
+        Criterion(
+            "no_path_traversal",
+            "No unsafe file path operations",
+            lambda ctx: ctx.get("path_traversal_risk", False) is False,
+        ),
+    ], pass_threshold=1.0)  # Security suite requires 100%
+
+
+# ──────────────────────────────────────────────
+# Convenience API
+# ──────────────────────────────────────────────
+
+_default_evaluator: Optional[Evaluator] = None
+
+
+def get_evaluator(storage_path: str | None = None) -> Evaluator:
+    global _default_evaluator
+    if _default_evaluator is None:
+        _default_evaluator = Evaluator(storage_path)
+        # Register standard suites
+        _default_evaluator.register_suite(bug_fix_suite())
+        _default_evaluator.register_suite(code_quality_suite())
+        _default_evaluator.register_suite(security_suite())
+    return _default_evaluator
+
+
+def eval_run(
+    suite_name: str,
+    agent_name: str,
+    run_id: str,
+    context: dict,
+    metadata: Optional[dict] = None,
+) -> EvalResult:
+    """One-shot evaluate a run against a named suite."""
+    return get_evaluator().run(suite_name, agent_name, run_id, context, metadata)
+
+
+def eval_batch(
+    suite_name: str,
+    agent_name: str,
+    run_contexts: list[dict],
+) -> list[EvalResult]:
+    """Batch evaluate multiple contexts."""
+    return get_evaluator().run_batch(suite_name, agent_name, run_contexts)

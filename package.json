@@ -1,0 +1,46 @@
+{
+  "name": "tiny-eval",
+  "version": "1.0.0",
+  "description": "Evaluation framework for autonomous AI agents. Benchmarks, grading rubrics, pass/fail criteria, regression tracking. Zero dependencies.",
+  "readme": "README.md",
+  "license": "MIT",
+  "keywords": [
+    "agent",
+    "evaluation",
+    "benchmark",
+    "ai",
+    "llm",
+    "testing",
+    "regression",
+    "grading",
+    "autonomous"
+  ],
+  "authors": [
+    {
+      "name": "Hussain Alsaibai",
+      "email": "hussain.alsaibai@gmail.com"
+    }
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hussain-alsaibai/tiny-eval"
+  },
+  "classifiers": [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Artificial Intelligence"
+  ],
+  "requiresPython": ">=3.9",
+  "entry_points": {
+    "console_scripts": [
+      "tiny-eval=tiny_eval.__main__:main"
+    ]
+  }
+}
