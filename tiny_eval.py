@@ -264,6 +264,11 @@ class Evaluator:
                             f"Registered: {list(self.suites.keys())}")
         result = self.suites[suite_name].evaluate(agent_name, run_id, context, metadata)
         self._save_result(result)
+        # The index is what list_results() and regression_check() read.
+        # Without this line the result was written to disk but never
+        # indexed, so list_results() always returned [] and every
+        # regression check reported 'unknown'.
+        self._append_index(result)
         return result
 
     def run_batch(

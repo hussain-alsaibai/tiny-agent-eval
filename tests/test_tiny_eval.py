@@ -232,7 +232,7 @@ class TestEvaluator:
         with tempfile.TemporaryDirectory() as tmpdir:
             ev = Evaluator(tmpdir)
             suite = EvalSuite("test", [
-                Criterion("a", "A", lambda ctx: True, weight=1.0),
+                Criterion("a", "A", lambda ctx: ctx["a"], weight=1.0),
             ])
             ev.register_suite(suite)
 
